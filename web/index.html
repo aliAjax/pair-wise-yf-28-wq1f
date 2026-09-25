@@ -1,4 +1,180 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>随机号损坏补发 - 临床试验随机化</title>
+<style>
+  body{font:15px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1040px;margin:24px auto;padding:0 16px;color:#222}
+  h1{font-size:20px} h2{font-size:16px;margin:0 0 10px}
+  .topbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;border:1px solid #bbb;padding:12px;border-radius:8px;margin-bottom:16px}
+  select,input,button,textarea{padding:6px 10px;font-size:14px}
+  textarea{width:100%;box-sizing:border-box}
+  .tabs{display:flex;gap:6px;margin-bottom:12px}
+  .tabs button{border:1px solid #888;background:#eee;cursor:pointer;border-radius:6px 6px 0 0}
+  .tabs button.active{background:#1a5fb4;color:#fff;border-color:#1a5fb4}
+  .panel{border:1px solid #bbb;border-radius:0 8px 8px 8px;padding:16px;display:none}
+  .panel.active{display:block}
+  table{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px}
+  th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#f0f3f7}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+  .pending{background:#e68a00}.approved{background:#2a9d2a}.rejected{background:#b3261e}
+  .frozen{background:#e68a00}.void{background:#777}.used{background:#2a9d2a}.available{background:#888}
+  .muted{color:#777}.err{color:#b3261e;white-space:pre-wrap}
+  .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+  code{background:#f4f4f4;padding:1px 5px;border-radius:3px}
+</style>
+</head>
+<body>
+<h1>临床试验随机分配 · 随机号损坏补发</h1>
+<div class="topbar">
+  <label>当前用户
+    <select id="user">
+      <option value="site1">site1（中心一）</option>
+      <option value="site2">site2（中心二）</option>
+      <option value="coord">coord（协调员）</option>
+      <option value="monitor1" selected>monitor1（监查员甲）</option>
+      <option value="monitor2">monitor2（监查员乙）</option>
+    </select>
+  </label>
+  <label>试验 <input id="trial" value="1" size="4"></label>
+  <button onclick="refreshAll()">刷新</button>
+  <span class="muted">全流程不显示试验组，仅显示随机编号</span>
+</div>
+
+<div class="tabs">
+  <button id="tab-start" onclick="showTab('start')">① 发起补发（中心/协调员）</button>
+  <button id="tab-review" class="active" onclick="showTab('review')">② 复核补发（监查员）</button>
+  <button id="tab-records" onclick="showTab('records')">③ 处理记录</button>
+</div>
+
+<div class="panel" id="panel-start">
+  <h2>本中心受试者</h2>
+  <p class="muted">受试者尚未用药而随机编号损坏时，点击“冻结原编号并申请补发”，冻结后须由<strong>另一名监查员</strong>复核。</p>
+  <div id="participants"></div>
+</div>
+
+<div class="panel active" id="panel-review">
+  <h2>待复核的补发申请</h2>
+  <p class="muted">复核通过：原编号作废（不再使用），从<strong>同一分层</strong>的未启用编号中按顺序补发；不通过：恢复原编号继续有效。</p>
+  <div id="pending"></div>
+</div>
+
+<div class="panel" id="panel-records">
+  <h2>处理记录</h2>
+  <div class="row">
+    <label><input type="radio" name="flt" value="" checked onchange="loadRecords()"> 全部</label>
+    <label><input type="radio" name="flt" value="pending" onchange="loadRecords()"> 待复核</label>
+    <label><input type="radio" name="flt" value="approved" onchange="loadRecords()"> 已补发</label>
+    <label><input type="radio" name="flt" value="rejected" onchange="loadRecords()"> 已驳回恢复</label>
+  </div>
+  <div id="records"></div>
+</div>
+
+<div id="msg" class="err"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+function showMsg(t,isErr){const m=$('msg');m.textContent=t||'';m.className=isErr?'err':'muted';}
+async function api(path,opt={}){
+  const r=await fetch(path,{headers:{'X-User-Id':$('user').value,'Content-Type':'application/json'},...opt});
+  const data=await r.json();
+  if(!r.ok) throw new Error((data.error&&data.error.message)||('请求失败 '+r.status));
+  return data;
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function statusTag(s){const map={pending:'待复核',approved:'已补发',rejected:'已驳回'};return `<span class="tag ${s}">${map[s]||s}</span>`;}
+function allocTag(s){const map={used:'使用中',frozen:'冻结中',void:'已作废',available:'未启用'};return `<span class="tag ${s}">${map[s]||s}</span>`;}
+function showTab(t){
+  ['start','review','records'].forEach(x=>{
+    $('tab-'+x).classList.toggle('active',x===t);
+    $('panel-'+x).classList.toggle('active',x===t);
+  });
+}
+
+async function loadParticipants(){
+  const el=$('participants');el.innerHTML='<span class="muted">加载中…</span>';
+  try{
+    const data=await api(`/api/trials/${$('trial').value}/participants`);
+    if(!data.items.length){el.innerHTML='<span class="muted">暂无受试者</span>';return;}
+    el.innerHTML=`<table><tr><th>受试者编号</th><th>中心</th><th>当前随机编号</th><th>编号状态</th><th>操作</th></tr>`+
+      data.items.map(p=>`<tr>
+        <td>${esc(p.external_id)}</td><td>${esc(p.site_id)}</td>
+        <td><code>${esc(p.allocation_code)}</code></td><td>${allocTag(p.allocation_status)}</td>
+        <td>${p.allocation_status==='frozen'
+            ? '<span class="muted">已冻结，等待监查员复核</span>'
+            : p.allocation_status==='void'
+            ? '<span class="muted">原编号已作废，已使用补发编号</span>'
+            : `<button onclick="askReplace(${p.id},${JSON.stringify(p.external_id)})">冻结原编号并申请补发</button>`}
+        </td></tr>`).join('')+'</table>';
+  }catch(e){el.innerHTML='';showMsg(e.message,true);}
+}
+
+async function askReplace(pid,external){
+  const reason=prompt(`为受试者 ${external} 发起随机号补发，请填写损坏原因（至少 8 字）：`);
+  if(reason===null)return;
+  try{
+    const r=await api(`/api/participants/${pid}/replacements`,{method:'POST',body:JSON.stringify({reason})});
+    showMsg(`已冻结原编号 ${r.old_allocation_code}，补发申请 #${r.id} 等待监查员复核。`);
+    refreshAll();
+  }catch(e){showMsg(e.message,true);}
+}
+
+function replacementTable(items, withActions){
+  if(!items.length)return '<span class="muted">暂无记录</span>';
+  const head=`<table><tr><th>申请#</th><th>受试者</th><th>中心</th><th>分层</th><th>原编号</th><th>新编号</th><th>状态/结论</th><th>原因</th><th>发起人</th><th>复核人</th><th>时间</th>${withActions?'<th>操作</th>':''}</tr>`;
+  return head+items.map(r=>`<tr>
+    <td>${r.id}</td><td>${esc(r.external_id)}</td><td>${esc(r.site_id)}</td>
+    <td>${esc(JSON.stringify(r.stratum))}</td>
+    <td><code>${esc(r.old_allocation_code)}</code></td>
+    <td>${r.new_allocation_code?`<code>${esc(r.new_allocation_code)}</code>`:'<span class="muted">—</span>'}</td>
+    <td>${statusTag(r.status)}<br><span class="muted">${esc(r.conclusion)}</span></td>
+    <td>${esc(r.reason)}${r.review_note?`<br><span class="muted">复核意见：${esc(r.review_note)}</span>`:''}</td>
+    <td>${esc(r.requester_id)}</td><td>${esc(r.reviewer_id||'—')}</td>
+    <td>${esc(r.created_at)}${r.reviewed_at?`<br><span class="muted">${esc(r.reviewed_at)}</span>`:''}</td>
+    ${withActions?`<td>${r.status==='pending'
+        ? `<button onclick="review(${r.id},'approved')">通过补发</button>
+           <button onclick="review(${r.id},'rejected')">驳回并恢复</button>`
+        : '—'}</td>`:''}
+  </tr>`).join('')+'</table>';
+}
+
+async function loadPending(){
+  const el=$('pending');el.innerHTML='<span class="muted">加载中…</span>';
+  try{
+    const data=await api(`/api/trials/${$('trial').value}/replacements?status=pending`);
+    el.innerHTML=replacementTable(data.items,true);
+  }catch(e){el.innerHTML='';showMsg(e.message,true);}
+}
+
+async function review(id,decision){
+  const note=prompt(decision==='approved'
+    ?'复核通过：将作废原编号并从同一分层补发。可填写复核意见（可留空）：'
+    :'复核不通过：将恢复原编号继续使用。请填写驳回原因（建议填写）：','')??'';
+  try{
+    const r=await api(`/api/allocation-replacements/${id}/review`,{method:'POST',body:JSON.stringify({decision,note})});
+    showMsg(decision==='approved'
+      ?`已补发：原编号 ${r.old_allocation_code} 作废，新编号 ${r.new_allocation_code}。`
+      :`已驳回：原编号 ${r.old_allocation_code} 已恢复有效。`);
+    refreshAll();
+  }catch(e){showMsg(e.message,true);}
+}
+
+async function loadRecords(){
+  const el=$('records');el.innerHTML='<span class="muted">加载中…</span>';
+  const f=document.querySelector('input[name="flt"]:checked').value;
+  try{
+    const q=f?`&status=${f}`:'';
+    const data=await api(`/api/trials/${$('trial').value}/replacements${q}`);
+    el.innerHTML=replacementTable(data.items,false);
+  }catch(e){el.innerHTML='';showMsg(e.message,true);}
+}
+
+function refreshAll(){showMsg('');loadParticipants();loadPending();loadRecords();}
+$('user').addEventListener('change',refreshAll);
+$('trial').addEventListener('change',refreshAll);
+refreshAll();
+</script>
+</body>
+</html>

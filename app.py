@@ -69,6 +69,8 @@ class RandomizationStore:
                     stratum_id INTEGER NOT NULL REFERENCES strata(id),
                     sequence INTEGER NOT NULL, block_no INTEGER NOT NULL,
                     arm TEXT NOT NULL, used_by INTEGER, used_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'available'
+                        CHECK(status IN ('available','used','frozen','void')),
                     UNIQUE(stratum_id,sequence)
                 );
                 CREATE TABLE IF NOT EXISTS participants(
@@ -90,12 +92,41 @@ class RandomizationStore:
                     first_approver TEXT REFERENCES users(id), second_approver TEXT REFERENCES users(id),
                     decided_at TEXT, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS allocation_replacements(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    participant_id INTEGER NOT NULL REFERENCES participants(id),
+                    old_allocation_id INTEGER NOT NULL REFERENCES allocations(id),
+                    new_allocation_id INTEGER REFERENCES allocations(id),
+                    old_allocation_code TEXT NOT NULL,
+                    new_allocation_code TEXT,
+                    requester_id TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL,
+                    reviewer_id TEXT REFERENCES users(id),
+                    review_note TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+                    created_at TEXT NOT NULL, reviewed_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, trial_id INTEGER REFERENCES trials(id),
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
                 """
+            )
+            # 旧库迁移：allocations.status 列与替换流程（CREATE TABLE IF NOT EXISTS 不会补列/约束）
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(allocations)").fetchall()}
+            if "status" not in cols:
+                conn.execute(
+                    "ALTER TABLE allocations ADD COLUMN status TEXT NOT NULL DEFAULT 'available'"
+                )
+                conn.execute(
+                    "UPDATE allocations SET status=CASE WHEN used_by IS NULL THEN 'available' ELSE 'used' END"
+                )
+            # 同一受试者同时只允许存在一条待复核的替换申请，防止重复发起/并发补发
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_replacements_one_pending
+                       ON allocation_replacements(participant_id) WHERE status='pending'"""
             )
 
     def seed(self):
@@ -240,7 +271,7 @@ class RandomizationStore:
                         (trial["id"], stratum["id"], start + offset, block_no, arm),
                     )
             free = conn.execute(
-                "SELECT * FROM allocations WHERE stratum_id=? AND used_by IS NULL ORDER BY sequence LIMIT 1", (stratum["id"],)
+                "SELECT * FROM allocations WHERE stratum_id=? AND status='available' ORDER BY sequence LIMIT 1", (stratum["id"],)
             ).fetchone()
             if free:
                 return free
@@ -274,7 +305,7 @@ class RandomizationStore:
                     (trial_id, actor["site_id"], external_id, stratum["id"], allocation["id"], allocation_code, user_id, now()),
                 )
                 participant_id = cur.lastrowid
-                conn.execute("UPDATE allocations SET used_by=?,used_at=? WHERE id=?", (participant_id, now(), allocation["id"]))
+                conn.execute("UPDATE allocations SET used_by=?,used_at=?,status='used' WHERE id=?", (participant_id, now(), allocation["id"]))
                 self._audit(conn, trial_id, user_id, "participant.enroll", {"participant_id": participant_id, "external_id": external_id, "allocation_id": allocation["id"], "site_id": actor["site_id"]})
                 participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
                 return self._blinded_participant(conn, participant, actor, allow_arm=False, idempotent=False)
@@ -297,6 +328,8 @@ class RandomizationStore:
             "allocation_code": participant["allocation_code"], "status": participant["status"],
             "created_at": participant["created_at"], "idempotent": idempotent,
         }
+        alloc = conn.execute("SELECT status FROM allocations WHERE id=?", (participant["allocation_id"],)).fetchone()
+        result["allocation_status"] = alloc["status"] if alloc else None
         if allow_arm:
             result["arm"] = conn.execute("SELECT arm FROM allocations WHERE id=?", (participant["allocation_id"],)).fetchone()["arm"]
         return result
@@ -375,6 +408,185 @@ class RandomizationStore:
                 conn.rollback()
                 raise
 
+    def _replacement_code(self, conn, trial_id, participant_id, replacement_id):
+        for salt in range(5):
+            code = "R" + hashlib.sha256(
+                f"{trial_id}:{participant_id}:{replacement_id}:{salt}".encode()
+            ).hexdigest()[:10].upper()
+            if not conn.execute(
+                "SELECT 1 FROM participants WHERE trial_id=? AND allocation_code=?", (trial_id, code)
+            ).fetchone():
+                return code
+        raise BusinessError("补发编号生成冲突，请重试", 500, "code_conflict")
+
+    def request_replacement(self, user_id, participant_id, reason):
+        """受试者用药前随机号损坏：登记原因并冻结原分配，等待另一名监查员复核。"""
+        reason = reason.strip()
+        if len(reason) < 8:
+            raise BusinessError("损坏原因至少 8 字", 422, "reason_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+                participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+                if not participant:
+                    raise BusinessError("受试者不存在", 404, "not_found")
+                if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
+                    raise BusinessError("不能为其他中心的受试者申请补发", 403, "site_isolation")
+                if participant["status"] != "enrolled":
+                    raise BusinessError("只有在组受试者可以申请编号补发", 409, "invalid_participant_status")
+                old = conn.execute("SELECT * FROM allocations WHERE id=?", (participant["allocation_id"],)).fetchone()
+                if old["status"] == "frozen":
+                    raise BusinessError("该受试者已有待复核的补发申请", 409, "replacement_pending")
+                if old["status"] == "void":
+                    raise BusinessError("原编号已作废，不能再次申请补发", 409, "allocation_void")
+                if old["status"] != "used":
+                    raise BusinessError("原编号状态异常，无法发起补发", 409, "invalid_allocation_status")
+                cur = conn.execute(
+                    """INSERT INTO allocation_replacements(
+                           trial_id,participant_id,old_allocation_id,old_allocation_code,
+                           requester_id,reason,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (participant["trial_id"], participant_id, old["id"], participant["allocation_code"],
+                     user_id, reason, now()),
+                )
+                replacement_id = cur.lastrowid
+                conn.execute("UPDATE allocations SET status='frozen' WHERE id=?", (old["id"],))
+                self._audit(conn, participant["trial_id"], user_id, "replacement.request", {
+                    "replacement_id": replacement_id, "participant_id": participant_id,
+                    "external_id": participant["external_id"], "old_allocation_id": old["id"],
+                    "old_allocation_code": participant["allocation_code"], "site_id": participant["site_id"],
+                })
+                row = conn.execute("SELECT * FROM allocation_replacements WHERE id=?", (replacement_id,)).fetchone()
+                return self._blinded_replacement(conn, row)
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                raise BusinessError("该受试者已有待复核的补发申请", 409, "replacement_pending")
+            except Exception:
+                conn.rollback()
+                raise
+
+    def review_replacement(self, user_id, replacement_id, decision, note=""):
+        """另一名监查员复核：通过则从同一分层未启用编号补发并作废原号；不通过则恢复原号。"""
+        decision = str(decision).strip().lower()
+        if decision not in ("approved", "rejected"):
+            raise BusinessError("复核结论必须是 approved 或 rejected", 422, "invalid_decision")
+        note = str(note or "").strip()
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                reviewer = self._user(conn, user_id, {"monitor"})
+                req = conn.execute("SELECT * FROM allocation_replacements WHERE id=?", (replacement_id,)).fetchone()
+                if not req:
+                    raise BusinessError("补发申请不存在", 404, "not_found")
+                if req["status"] != "pending":
+                    raise BusinessError("该补发申请已经完成复核", 409, "already_decided")
+                if req["requester_id"] == user_id:
+                    raise BusinessError("复核人不能是发起人本人", 409, "distinct_reviewer_required")
+                participant = conn.execute("SELECT * FROM participants WHERE id=?", (req["participant_id"],)).fetchone()
+                old = conn.execute("SELECT * FROM allocations WHERE id=?", (req["old_allocation_id"],)).fetchone()
+                if old is None or old["status"] != "frozen" or participant["allocation_id"] != old["id"]:
+                    raise BusinessError("原编号冻结状态已变化，不能复核", 409, "state_changed")
+
+                if decision == "rejected":
+                    conn.execute("UPDATE allocations SET status='used' WHERE id=?", (old["id"],))
+                    conn.execute(
+                        "UPDATE allocation_replacements SET status='rejected',reviewer_id=?,review_note=?,reviewed_at=? WHERE id=?",
+                        (user_id, note, now(), replacement_id),
+                    )
+                    self._audit(conn, req["trial_id"], user_id, "replacement.reject", {
+                        "replacement_id": replacement_id, "participant_id": participant["id"],
+                        "old_allocation_code": req["old_allocation_code"], "restored": True,
+                    })
+                else:
+                    trial = self._trial(conn, req["trial_id"])
+                    stratum = conn.execute("SELECT * FROM strata WHERE id=?", (old["stratum_id"],)).fetchone()
+                    new_alloc = self._next_allocation(conn, trial, stratum)
+                    new_code = self._replacement_code(conn, req["trial_id"], participant["id"], replacement_id)
+                    conn.execute(
+                        "UPDATE allocations SET used_by=?,used_at=?,status='used' WHERE id=?",
+                        (participant["id"], now(), new_alloc["id"]),
+                    )
+                    conn.execute("UPDATE allocations SET status='void' WHERE id=?", (old["id"],))
+                    conn.execute(
+                        """UPDATE participants SET allocation_id=?,allocation_code=? WHERE id=?""",
+                        (new_alloc["id"], new_code, participant["id"]),
+                    )
+                    conn.execute(
+                        """UPDATE allocation_replacements
+                           SET status='approved',reviewer_id=?,review_note=?,new_allocation_id=?,
+                               new_allocation_code=?,reviewed_at=? WHERE id=?""",
+                        (user_id, note, new_alloc["id"], new_code, now(), replacement_id),
+                    )
+                    self._audit(conn, req["trial_id"], user_id, "replacement.approve", {
+                        "replacement_id": replacement_id, "participant_id": participant["id"],
+                        "external_id": participant["external_id"],
+                        "old_allocation_id": old["id"], "old_allocation_code": req["old_allocation_code"],
+                        "new_allocation_id": new_alloc["id"], "new_allocation_code": new_code,
+                        "same_stratum_id": stratum["id"],
+                    })
+                row = conn.execute("SELECT * FROM allocation_replacements WHERE id=?", (replacement_id,)).fetchone()
+                return self._blinded_replacement(conn, row)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _blinded_replacement(self, conn, row):
+        """替换记录视图：只暴露编号，绝不包含试验组。"""
+        participant = conn.execute(
+            "SELECT external_id,site_id FROM participants WHERE id=?", (row["participant_id"],)
+        ).fetchone()
+        stratum_id = conn.execute(
+            "SELECT stratum_id FROM allocations WHERE id=?", (row["old_allocation_id"],)
+        ).fetchone()["stratum_id"]
+        factors = conn.execute("SELECT factors_json FROM strata WHERE id=?", (stratum_id,)).fetchone()["factors_json"]
+        return {
+            "id": row["id"], "trial_id": row["trial_id"],
+            "participant_id": row["participant_id"],
+            "external_id": participant["external_id"], "site_id": participant["site_id"],
+            "old_allocation_code": row["old_allocation_code"],
+            "new_allocation_code": row["new_allocation_code"],
+            "stratum": json.loads(factors),
+            "requester_id": row["requester_id"], "reason": row["reason"],
+            "reviewer_id": row["reviewer_id"], "review_note": row["review_note"],
+            "status": row["status"], "created_at": row["created_at"], "reviewed_at": row["reviewed_at"],
+            "conclusion": {"pending": "待复核", "approved": "复核通过，已补发", "rejected": "复核不通过，原编号已恢复"}[row["status"]],
+        }
+
+    def list_replacements(self, user_id, trial_id=None, status=None):
+        if status is not None and status not in ("pending", "approved", "rejected"):
+            raise BusinessError("状态筛选无效", 422, "invalid_status")
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            sql, params = "SELECT * FROM allocation_replacements", []
+            clauses = []
+            if trial_id is not None:
+                clauses.append("trial_id=?"); params.append(trial_id)
+            if status is not None:
+                clauses.append("status=?"); params.append(status)
+            if actor["role"] == "site":
+                clauses.append(
+                    "participant_id IN (SELECT id FROM participants WHERE site_id=?)"
+                )
+                params.append(actor["site_id"])
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY id"
+            rows = conn.execute(sql, params).fetchall()
+            return [self._blinded_replacement(conn, row) for row in rows]
+
+    def get_replacement(self, user_id, replacement_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            row = conn.execute("SELECT * FROM allocation_replacements WHERE id=?", (replacement_id,)).fetchone()
+            if not row:
+                raise BusinessError("补发申请不存在", 404, "not_found")
+            if actor["role"] == "site":
+                participant = conn.execute("SELECT site_id FROM participants WHERE id=?", (row["participant_id"],)).fetchone()
+                if participant["site_id"] != actor["site_id"]:
+                    raise BusinessError("只能查看本中心的处理记录", 403, "site_isolation")
+            return self._blinded_replacement(conn, row)
+
     def trial_summary(self, user_id, trial_id):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
@@ -426,9 +638,25 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="replacements" and method=="GET":
+                from urllib.parse import parse_qs
+                status=parse_qs(urlparse(self.path).query).get("status",[None])[0]
+                return self._send(200, {"items": store.list_replacements(user,trial_id,status)})
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
+        if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="replacements" and method=="POST":
+            d=self._body(); return self._send(201, store.request_replacement(user,int(parts[2]),d.get("reason","")))
+        if len(parts)==3 and parts[:2]==["api","allocation-replacements"] and method=="GET":
+            return self._send(200, store.get_replacement(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","allocation-replacements"] and parts[3]=="review" and method=="POST":
+            d=self._body(); return self._send(200, store.review_replacement(user,int(parts[2]),d.get("decision",""),d.get("note","")))
+        if parts==["api","allocation-replacements"] and method=="GET":
+            from urllib.parse import parse_qs
+            qs=parse_qs(urlparse(self.path).query)
+            trial_id=int(qs["trial_id"][0]) if qs.get("trial_id") else None
+            status=qs.get("status",[None])[0]
+            return self._send(200, {"items": store.list_replacements(user,trial_id,status)})
         if len(parts)==4 and parts[:2]==["api","unblinding-requests"] and parts[3]=="approve" and method=="POST":
             return self._send(200, store.approve_unblinding(user,int(parts[2])))
         raise BusinessError("接口不存在",404,"not_found")
