@@ -90,6 +90,16 @@ class RandomizationStore:
                     first_approver TEXT REFERENCES users(id), second_approver TEXT REFERENCES users(id),
                     decided_at TEXT, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS replacement_requests(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    participant_id INTEGER NOT NULL REFERENCES participants(id),
+                    old_allocation_id INTEGER NOT NULL REFERENCES allocations(id),
+                    new_allocation_id INTEGER REFERENCES allocations(id),
+                    old_code TEXT NOT NULL, new_code TEXT,
+                    requester_id TEXT NOT NULL REFERENCES users(id), reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+                    reviewer_id TEXT REFERENCES users(id), decided_at TEXT, created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, trial_id INTEGER REFERENCES trials(id),
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
@@ -240,7 +250,10 @@ class RandomizationStore:
                         (trial["id"], stratum["id"], start + offset, block_no, arm),
                     )
             free = conn.execute(
-                "SELECT * FROM allocations WHERE stratum_id=? AND used_by IS NULL ORDER BY sequence LIMIT 1", (stratum["id"],)
+                """SELECT * FROM allocations WHERE stratum_id=? AND used_by IS NULL
+                   AND id NOT IN (SELECT old_allocation_id FROM replacement_requests WHERE status='pending')
+                   ORDER BY sequence LIMIT 1""",
+                (stratum["id"],),
             ).fetchone()
             if free:
                 return free
@@ -291,10 +304,15 @@ class RandomizationStore:
                 raise
 
     def _blinded_participant(self, conn, participant, viewer, allow_arm=False, idempotent=False):
+        frozen = conn.execute(
+            "SELECT 1 FROM replacement_requests WHERE participant_id=? AND status='pending'",
+            (participant["id"],),
+        ).fetchone() is not None
         result = {
             "id": participant["id"], "trial_id": participant["trial_id"],
             "external_id": participant["external_id"], "site_id": participant["site_id"],
             "allocation_code": participant["allocation_code"], "status": participant["status"],
+            "allocation_frozen": frozen,
             "created_at": participant["created_at"], "idempotent": idempotent,
         }
         if allow_arm:
@@ -375,6 +393,162 @@ class RandomizationStore:
                 conn.rollback()
                 raise
 
+    def _replacement_record(self, conn, request):
+        participant = conn.execute("SELECT * FROM participants WHERE id=?", (request["participant_id"],)).fetchone()
+        conclusion = {
+            "pending": "待复核：原分配已冻结，暂停用药流程",
+            "approved": "复核通过：已从同一分层补发新编号，原编号作废不再使用",
+            "rejected": "复核不通过：恢复原编号继续使用",
+        }[request["status"]]
+        return {
+            "id": request["id"], "participant_id": request["participant_id"],
+            "external_id": participant["external_id"], "site_id": participant["site_id"],
+            "old_code": request["old_code"], "new_code": request["new_code"],
+            "reason": request["reason"], "status": request["status"], "conclusion": conclusion,
+            "requester_id": request["requester_id"], "reviewer_id": request["reviewer_id"],
+            "created_at": request["created_at"], "decided_at": request["decided_at"],
+        }
+
+    def request_replacement(self, user_id, participant_id, reason):
+        """用药前随机号损坏：写明原因并冻结原分配，等待另一名监查员复核。"""
+        reason = str(reason).strip()
+        if len(reason) < 8:
+            raise BusinessError("替换原因至少 8 字", 422, "reason_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+                participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+                if not participant:
+                    raise BusinessError("受试者不存在", 404, "not_found")
+                if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
+                    raise BusinessError("不能为其他中心的受试者发起替换", 403, "site_isolation")
+                if participant["status"] != "enrolled":
+                    raise BusinessError("只有在组受试者可以发起随机号替换", 409, "invalid_status")
+                trial = self._trial(conn, participant["trial_id"])
+                if trial["status"] != "running":
+                    raise BusinessError("试验未在入组中，不能发起随机号替换", 409, "trial_not_running")
+                if conn.execute(
+                    "SELECT 1 FROM replacement_requests WHERE participant_id=? AND status='pending'",
+                    (participant_id,),
+                ).fetchone():
+                    raise BusinessError("该受试者已有待复核的替换申请", 409, "request_exists")
+                cur = conn.execute(
+                    """INSERT INTO replacement_requests(participant_id,old_allocation_id,old_code,requester_id,reason,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (participant_id, participant["allocation_id"], participant["allocation_code"], user_id, reason, now()),
+                )
+                self._audit(
+                    conn, participant["trial_id"], user_id, "replacement.request",
+                    {"request_id": cur.lastrowid, "participant_id": participant_id, "old_code": participant["allocation_code"]},
+                )
+                request = conn.execute("SELECT * FROM replacement_requests WHERE id=?", (cur.lastrowid,)).fetchone()
+                return self._replacement_record(conn, request)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def review_replacement(self, user_id, request_id, decision):
+        """另一名监查员复核：通过则同分层补发，不通过则恢复原编号。"""
+        decision = str(decision).strip().lower()
+        if decision not in ("approve", "reject"):
+            raise BusinessError("复核结论必须为 approve 或 reject", 422, "invalid_decision")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"monitor"})
+                request = conn.execute("SELECT * FROM replacement_requests WHERE id=?", (request_id,)).fetchone()
+                if not request:
+                    raise BusinessError("替换申请不存在", 404, "not_found")
+                if request["status"] != "pending":
+                    raise BusinessError("替换申请已完成复核", 409, "already_decided")
+                if request["requester_id"] == user_id:
+                    raise BusinessError("发起与复核必须由不同人员完成", 409, "distinct_reviewer_required")
+                participant = conn.execute("SELECT * FROM participants WHERE id=?", (request["participant_id"],)).fetchone()
+                if decision == "reject":
+                    # 不改动受试者当前分配，仅解除冻结状态，原编号恢复使用
+                    conn.execute(
+                        "UPDATE replacement_requests SET status='rejected',reviewer_id=?,decided_at=? WHERE id=?",
+                        (user_id, now(), request_id),
+                    )
+                    self._audit(
+                        conn, participant["trial_id"], user_id, "replacement.reject",
+                        {"request_id": request_id, "participant_id": participant["id"]},
+                    )
+                else:
+                    trial = self._trial(conn, participant["trial_id"])
+                    stratum = conn.execute("SELECT * FROM strata WHERE id=?", (participant["stratum_id"],)).fetchone()
+                    allocation = self._next_allocation(conn, trial, stratum)
+                    new_code = hashlib.sha256(
+                        f"{participant['trial_id']}:{participant['external_id']}:R{request_id}".encode()
+                    ).hexdigest()[:12].upper()
+                    conn.execute(
+                        "UPDATE allocations SET used_by=?,used_at=? WHERE id=?",
+                        (participant["id"], now(), allocation["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE participants SET allocation_id=?,allocation_code=? WHERE id=?",
+                        (allocation["id"], new_code, participant["id"]),
+                    )
+                    # 原分配保持占用状态，且由申请记录标记作废，不会再次发放
+                    conn.execute(
+                        """UPDATE replacement_requests
+                           SET status='approved',new_allocation_id=?,new_code=?,reviewer_id=?,decided_at=? WHERE id=?""",
+                        (allocation["id"], new_code, user_id, now(), request_id),
+                    )
+                    self._audit(
+                        conn, participant["trial_id"], user_id, "replacement.approve",
+                        {"request_id": request_id, "participant_id": participant["id"],
+                         "old_code": request["old_code"], "new_code": new_code},
+                    )
+                updated = conn.execute("SELECT * FROM replacement_requests WHERE id=?", (request_id,)).fetchone()
+                return self._replacement_record(conn, updated)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_replacements(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            if actor["role"] == "site":
+                rows = conn.execute(
+                    """SELECT r.* FROM replacement_requests r JOIN participants p ON p.id=r.participant_id
+                       WHERE p.trial_id=? AND p.site_id=? ORDER BY r.id""",
+                    (trial_id, actor["site_id"]),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT r.* FROM replacement_requests r JOIN participants p ON p.id=r.participant_id
+                       WHERE p.trial_id=? ORDER BY r.id""",
+                    (trial_id,),
+                ).fetchall()
+            return [self._replacement_record(conn, row) for row in rows]
+
+    def list_participant_replacements(self, user_id, participant_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+            if not participant:
+                raise BusinessError("受试者不存在", 404, "not_found")
+            if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
+                raise BusinessError("只能查看本中心受试者", 403, "site_isolation")
+            rows = conn.execute(
+                "SELECT * FROM replacement_requests WHERE participant_id=? ORDER BY id", (participant_id,)
+            ).fetchall()
+            return [self._replacement_record(conn, row) for row in rows]
+
+    def get_replacement(self, user_id, request_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            request = conn.execute("SELECT * FROM replacement_requests WHERE id=?", (request_id,)).fetchone()
+            if not request:
+                raise BusinessError("替换申请不存在", 404, "not_found")
+            participant = conn.execute("SELECT * FROM participants WHERE id=?", (request["participant_id"],)).fetchone()
+            if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
+                raise BusinessError("只能查看本中心受试者", 403, "site_isolation")
+            return self._replacement_record(conn, request)
+
     def trial_summary(self, user_id, trial_id):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
@@ -426,11 +600,21 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="replacement-requests" and method=="GET":
+                return self._send(200, {"items": store.list_replacements(user,trial_id)})
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
+        if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="replacement-requests" and method=="POST":
+            d=self._body(); return self._send(201, store.request_replacement(user,int(parts[2]),d.get("reason","")))
+        if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="replacement-requests" and method=="GET":
+            return self._send(200, {"items": store.list_participant_replacements(user,int(parts[2]))})
+        if len(parts)==3 and parts[:2]==["api","replacement-requests"] and method=="GET":
+            return self._send(200, store.get_replacement(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","unblinding-requests"] and parts[3]=="approve" and method=="POST":
             return self._send(200, store.approve_unblinding(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","replacement-requests"] and parts[3]=="review" and method=="POST":
+            d=self._body(); return self._send(200, store.review_replacement(user,int(parts[2]),d.get("decision","")))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)

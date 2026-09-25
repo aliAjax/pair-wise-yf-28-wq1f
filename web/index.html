@@ -1,4 +1,54 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}
+select,button,input,textarea{padding:8px;margin:4px;font:14px system-ui}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:12px}
+.panel h2{margin:0 0 8px;font-size:17px}
+input,textarea{width:240px}
+textarea{height:46px;vertical-align:top}
+.narrow{width:100px}
+</style></head>
+<body><h1>临床试验随机分配与盲法</h1>
+<div class="panel"><h2>当前用户与试验</h2>
+<select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select>
+<input id="trial" value="1" class="narrow">
+<button onclick="loadSummary()">查看试验摘要</button>
+<button onclick="loadParticipants()">查看受试者</button>
+<button onclick="loadReplacements()">查看替换处理记录</button></div>
+
+<div class="panel"><h2>入组受试者（响应只含随机号，不含试验组）</h2>
+<input id="ext" placeholder="外部受试者编号，如 S001-001">
+<input id="factors" value='{"risk":"low"}' placeholder="分层因素 JSON">
+<button onclick="enroll()">入组</button></div>
+
+<div class="panel"><h2>发起随机号替换（用药前编号损坏）</h2>
+<input id="repPid" placeholder="受试者 ID" class="narrow">
+<textarea id="repReason" placeholder="损坏原因（至少 8 字），如：随机号标签污损无法辨认"></textarea>
+<button onclick="requestReplacement()">发起并冻结原分配</button>
+<button onclick="loadParticipantReplacements()">查看该受试者记录</button></div>
+
+<div class="panel"><h2>监查员复核（须由非发起人复核）</h2>
+<input id="repRid" placeholder="替换申请 ID" class="narrow">
+<select id="repDecision"><option value="approve">通过：同一分层补发新编号</option><option value="reject">不通过：恢复原编号</option></select>
+<button onclick="reviewReplacement()">提交复核</button></div>
+
+<pre id="out"></pre>
+<script>
+async function api(method,url,body){
+  const opt={method,headers:{"X-User-Id":user.value,"Content-Type":"application/json"}};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt);
+  out.textContent=JSON.stringify(await r.json(),null,2);
+}
+function loadSummary(){api("GET",`/api/trials/${trial.value}/summary`)}
+function loadParticipants(){api("GET",`/api/trials/${trial.value}/participants`)}
+function loadReplacements(){api("GET",`/api/trials/${trial.value}/replacement-requests`)}
+function enroll(){
+  let f;try{f=JSON.parse(factors.value)}catch(e){out.textContent="分层因素必须是合法 JSON";return}
+  api("POST",`/api/trials/${trial.value}/enroll`,{external_id:ext.value,factors:f})
+}
+function requestReplacement(){api("POST",`/api/participants/${repPid.value}/replacement-requests`,{reason:repReason.value})}
+function loadParticipantReplacements(){api("GET",`/api/participants/${repPid.value}/replacement-requests`)}
+function reviewReplacement(){api("POST",`/api/replacement-requests/${repRid.value}/review`,{decision:repDecision.value})}
+</script></body></html>
